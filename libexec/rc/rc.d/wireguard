@@ -1,0 +1,739 @@
+#!/bin/sh
+#
+# $FreeBSD$
+
+
+
+################################################################################
+# The rc.d boilerplate
+################################################################################
+
+# PROVIDE: wireguard
+# REQUIRE: netif devd resolv
+# BEFORE: routing
+# KEYWORD: nojailvnet shutdown
+
+. /etc/rc.subr
+. /etc/network.subr
+
+name='wireguard'
+
+desc='Manage WireGuard tunnel interfaces'
+required_modules='if_wg:if_wg'
+
+rcvar='wireguard_enable' wireguard_enable_desc='Enable WireGuard'
+set_rcvar wireguard_interfaces    ''                   'List of interface, auto-detect if left empty'
+set_rcvar wireguard_conf_dir      '/etc/wireguard'     'Directory containing the WireGuard configuration files'
+set_rcvar wireguard_run_dir       '/var/run/wireguard' 'WireGuard state directory (must be writeable)'
+set_rcvar wireguard_timeout       '60'                 'Timeout in seconds to aquire each interface lock'
+set_rcvar wireguard_destroy_delay '10'                 'Wait up to this many seconds for interface destruction'
+
+extra_commands='create preup postup predown postdown destroy'
+start_cmd='run start'
+stop_cmd='run stop'
+restart_cmd='run restart'
+create_cmd='run create'
+preup_cmd='run preup'
+postup_cmd='run postup'
+predown_cmd='run predown'
+postdown_cmd='run postdown'
+
+# Prevent tempering with the locking protocol by saving $wireguard_lock in the argument list before parsing
+set -- "${wireguard_lock:-}" "$@"
+load_rc_config $name
+load_rc_config network
+wireguard_lock="$1"; shift
+
+################################################################################
+# Expand empty interface list
+################################################################################
+
+# The kernel only requires interface names to be unique, non-empty and not too long.
+# These (additional) constraints are necessary to enable sane (shell) scripting.
+# Interface names must:
+#   * not contain any common field separators.
+#   * not trigger shell path expansion.
+#   * be valid visible file names.
+validate_names() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			????????????????*) err 64 "Invalid interface name $1 (too long)"            ;;
+		                   '') err 64 "Invalid interface name (empty string)"           ;;
+			     *[$' \t\n']*) err 64 "Invalid interface name $1 (contains whitespace)" ;;
+		           *['?*][']*) err 64 "Invalid interface name $1 (contains glob)"       ;;
+			              */*) err 64 "Invalid interface name $1 (contains slash)"      ;;
+			               .*) err 64 "Invalid interface name $1 (starts with dot)"     ;;
+		esac
+		shift
+	done
+}
+
+# The WireGuard rc.d script enables itself if the configuration directory exists.
+# The default can be overwritten e.g. `service wireguard enable` or `sysrc wireguard_enable=YES`.
+if [ -d "${wireguard_conf_dir:-}" ]; then
+	: "${wireguard_enable:=YES}"
+	wireguard_enable_defval=YES
+else
+	: "${wireguard_enable:=NO}"
+	wireguard_enable_defval=NO
+fi
+
+# Expand the list of WireGuard interfaces to manage:
+#   * If a non-empty list has been provided as argument to the script use it.
+#   * If the list is empty and $wireguard_interface isn't split it (according to $IFS).
+#   * If both are empty and the WireGuard configuration directory exists infer the list
+#     from the readable WireGuard configuration files in the configuration directory.
+if [ $# -eq 1 ]; then
+	rc_arg="$1"; shift
+	if [ -n "$wireguard_interfaces" ]; then
+		set -f -- $wireguard_interfaces; set +f
+	else
+		if [ -d "$wireguard_conf_dir" ]; then
+			for full_path in "$wireguard_conf_dir"/*.conf; do
+				if [ -r "$full_path" ]; then
+					base_name="${full_path##*/}"
+					set -- "$@" "${base_name%.conf}";
+				fi
+			done
+		fi
+	fi
+	set -- "$rc_arg" "$@"
+fi
+
+
+
+################################################################################
+# Validate the selected interface names
+################################################################################
+
+# Bail out early if any interface name on the (expanded) list of WireGuard interfaces can't
+# be managed by shell scripts.
+if [ $# -gt 0 ]; then
+	rc_arg="$1"; shift
+	validate_names "$@"
+	set -- "$rc_arg" "$@"
+fi
+
+# Require the configuration directory to exist if the WireGuard rc.d service is enabled.
+: "${required_dirs:="$wireguard_conf_dir"}"
+
+# Require a configuration file with the ".conf" suffix for each WireGuard interface to be controlled.
+: "${required_files:=}"
+if [ $# -gt 1 ]; then
+	rc_arg="$1"; shift
+	for interface; do
+		if [ -z "$required_files" ]; then
+			required_files="$wireguard_conf_dir/$interface.conf"
+		else
+			required_files="$required_files $wireguard_conf_dir/$interface.conf"
+		fi
+	done
+	set -- "$rc_arg" "$@"
+fi
+
+
+
+################################################################################
+# Helper functions to undo partial state modifications
+################################################################################
+
+# This rc.d script has to split the commands into multiple operations.
+# These operations can fail leaving behind a partially modified system state.
+# Setup operations are expected to push teardown functions undoing their their modifications to the system state.
+# Teardown operations are expected to ignore most errors allowing relying on the kernel to destroy most state.
+# On failure of an operation the undo stack unwound in an attempt to restore the old system state.
+# On success of a command (not just an operation) the undo stack is discarded.
+
+UNDO=''
+
+flush_undo() {
+	debug "Undo stack: $UNDO -> "
+	UNDO=''
+}
+
+run_undo() {
+	set -f -- $UNDO; set +f
+	while [ $# -gt 0 ]; do
+		"$1"; shift
+	done
+	flush_undo
+}
+
+add_undo() {
+	local IFS=' '
+	debug "Undo stack: $UNDO -> $* $UNDO"
+	set -f -- "$@" $UNDO; set +f
+	UNDO="$*"
+}
+
+# Use signal handlers and the exit handler to clean up before exiting.
+# NOTE: Only global variables are accessible in the handler context.
+trap 'run_undo; exit' EXIT INT TERM HUP
+
+
+
+################################################################################
+# Helper functions to cache ifconfig's output and interpret the cached output
+################################################################################
+
+# The script caches the ifconfig output to reduce the number of ifconfig processes spawned.
+CACHE='' # the cached ifconfig output
+VALID='' # empty = invalid, non-empty = valid
+
+# Mark the cache as invalid and set the cache to the empty string.
+flush_cache() {
+	CACHE=''
+	VALID=''
+}
+
+# Update the cache and mark it valid should ifconfig fail the cache is valid but contains the empty string.
+update_cache() {
+	if ! CACHE="$(ifconfig -f addr:numeric,ether:colon,inet:cidr,inet6:cidr -n -- "$INTERFACE" 2>/dev/null)"$'\n'; then
+		CACHE=''
+	fi
+	VALID=y
+}
+
+# Fill the cache if it's not already valid.
+fill_cache() {
+	if [ -z "$VALID" ]; then
+		update_cache
+	fi
+}
+
+# Check if $INTERFACE exists using the ifconfig output cache.
+exists() {
+	fill_cache && [ -n "$CACHE" ]
+}
+
+# Check if the interface is a WireGuard interface using the ifconfig output cache.
+# NOTE: There's no WireGuard media-type to check for. Membership in the 'wg' interface group is all we can test for.
+in_wg() {
+	fill_cache
+	set -- "${CACHE#*$'\n\tgroups:'}"; set -- "${1%%$'\n'*} "
+	case "$1" in
+		*' wg '*) true ;;
+			   *) false ;;
+	esac
+}
+
+# Check if $INTERFACE is up using the ifconfig output cache.
+is_up() {
+	fill_cache
+	# The the UP flag is the lowest of the 16 interface flag bits.
+	# Match against the hex representation of the interface flags instead of the decoded list.
+	case "$CACHE" in
+		"$INTERFACE: flags="???[13579bdfBDF]'<'*) true	;;
+											   *) false ;;
+	esac
+}
+
+
+
+##############################################################6085##################
+# Declared the operations commands are split up into.
+################################################################################
+
+# The name of the created interface has to be tracked to clean up failures to name the interface correctly.
+CREATED=''
+
+# Attempt to create and rename a WireGuard interface.
+# NOTE: Interface cloning and naming are two operations which can fail separately.
+create() {
+	add_undo destroy
+	if in_wg; then
+		debug "WireGuard interface $INTERFACE already exists."
+	elif exists; then
+		err 64 "The existing $INTERFACE interface is no WireGuard interface."
+	else
+		if CREATED="$(ifconfig -- wg create name "$INTERFACE")"; then
+			info "Created WireGuard interface $INTERFACE."
+			flush_cache
+		else
+			warn "Failed to create WireGuard interface $INTERFACE."
+			flush_cache
+			in_wg || exit 1
+		fi
+	fi
+}
+
+# Attempt to destroy a WireGuard interface.
+destroy() {
+	# Is there a temporary unrenamed interface to destroy?
+	if [ "$CREATED" != "$INTERFACE" ] && [ -n "$CREATED" ]; then
+			warn "Failed to rename created WireGuard interface from $CREATED to $INTERFACE."
+			if ifconfig -n -- "$CREATED" destroy; then
+				info "Destroyed created WireGuard interface $CREATED."
+			else
+				err $? "Failed to destroy created WireGuard interface $CREATED."
+			fi
+	fi
+
+	if in_wg; then
+		if checkyesno Sticky; then
+			info "Preserved the sticky WireGuard interface $INTERFACE."
+		else
+			ifconfig -n -- "$INTERFACE" destroy
+			debug "Waiting up to ${wireguard_destroy_delay:-} seconds for the $INTERFACE interface destruction."
+			netstat -w 1 -q "$wireguard_destroy_delay" -I "$INTERFACE" >/dev/null 2>&1 || true
+
+			flush_cache
+			if in_wg; then
+				err 1 "Failed to destroy WireGuard interface $INTERFACE."
+			elif exists; then
+				err 1 "WireGuard interface $INTERFACE has been replace by a non-WireGuard interface."
+			else
+				info "Destroyed WireGuard interface $INTERFACE."
+			fi
+		fi
+	elif exists; then
+		err 64 "Refusing to destroy non-WireGuard interface $INTERFACE." 
+	else
+		warn "There was no $INTERFACE interface to destroy."
+	fi
+}
+
+# Compare the configured interface MTU against the ifconfig output cache.
+check_mtu() {
+	fill_cache
+	case "${CACHE%%$'\n'*} " in
+		*" mtu $MTU "*) true  ;;
+					 *) false ;;
+	esac
+}
+
+# Apply the the configure WireGuard interface MTU.
+set_mtu() {
+	local MTU="${MTU:-1420}"
+
+	if ! exists; then
+		err 1 "Missing WireGuard interface $INTERFACE to set MTU on."
+	elif ! in_wg; then
+		err 64 "Refusing to update the MTU on non-WireGuard interface $INTERFACE."
+	elif check_mtu; then
+		debug "MTU on WireGuard interface $INTERFACE is already correct."
+	else 
+		if ifconfig -n -- "$INTERFACE" mtu "$MTU"; then
+			flush_cache
+			info "Set interface MTU on WireGuard interface $INTERFACE to $MTU."
+		else
+			err $? "Failed to set interface MTU on $INTERFACE to $MTU."
+		fi
+	fi
+}
+
+# Load the WireGuard interface configuration into the kernel.
+set_conf() {
+	add_undo del_conf
+	if ! exists; then
+		err 1 "Missing WireGuard interface $INTERFACE to configure."
+	elif ! in_wg; then
+		err 64 "Refusing futile request to apply WireGuard configuration to non-WireGuard interface $INTERFACE."
+	else
+		if wg setconf "$INTERFACE" /dev/stdin <<- EOF
+			$Filtered
+		EOF
+		then
+			info "Applied WireGuard configuration to $INTERFACE interface."
+			return 0
+		else
+			err $? "Failed to apply WireGuard configuration to $INTERFACE interface."
+		fi
+	fi
+}
+
+# Remove the WireGuard interface configuration from the kernel (aka load the empty configuration).
+del_conf() {
+	if ! exists; then
+		warn "Missing WireGuard interface $INTERFACE to deconfigure."
+	elif ! in_wg; then
+		err 64 "Refusing to remove WireGuard configuration from non-WireGuard interface $INTERFACE."
+	else
+		if wg setconf "$INTERFACE" /dev/null; then
+			info "Removed WireGuard configuration from $INTERFACE interface."
+		else
+			flush_cache
+			if ! exists; then
+				warn "Missing WireGuard interface $INTERFACE to deconfigure."
+			elif ! in_wg; then
+				err 64 "Refusing to remove WireGuard configuration from non-WireGuard interface $INTERFACE."
+			fi
+				err 1 "Failed to remove WireGuard configuration from $INTERFACE interface."
+		fi
+	fi
+}
+
+# Attempt to remove all configured inner tunnel addresses from a WireGuard interface.
+del_addr() {
+	local addr out IFS=$', \t\n'
+
+	if ! exists; then
+		warn "Missing WireGuard interface $INTERFACE to remove inner tunnel addresses from."
+	elif ! in_wg; then
+		warn "Refusing request to remove inner tunnel addresses from non-WireGuard interface $INTERFACE."
+	else
+		debug "Removing innner tunnel addresses from WireGuard interface $INTERFACE."
+
+		for addr in $Address; do
+			set -- ifconfig -n -- "$INTERFACE"
+			case $addr in
+				*:*) set -- "$@" inet6 "$addr" -alias ;;
+				  *) set -- "$@" inet  "$addr" -alias ;;
+			esac
+			if out="$("$@" 2>&1)"; then
+				info "Removed address $addr from WireGuard interface $INTERFACE."
+			else
+				if [ "$out" = "ifconfig: ioctl (SIOCDIFADDR): Can't assign requested address" ]; then
+					warn "The inner tunnel address $addr wasn't configured on WireGuard interface $INTERFACE."
+				else
+					flush_cache
+					if ! exists; then
+						warn "Missing WireGuard interface $INTERFACE to remove inner tunnel addresses from."
+					elif ! in_wg; then
+						warn "The $INTERFACE interface is no longer a WireGuard interface."
+					else
+						warn "Failed to remove the inner tunnel address $addr from WireGuard interface $INTERFACE."
+					fi
+					return
+				fi
+			fi
+		done
+		flush_cache
+	fi
+}
+
+# Add all configured inner tunnnel addresses to a WireGuard interface.
+add_addr() {
+	local addr IFS=$', \t\n'
+
+	if ! exists; then
+		err 1 "Missing WireGuard interface $INTERFACE to add inner tunnel addresses to."
+	elif ! in_wg; then
+		err 1 "Refusing request to add inner tunnel addresses to non-WireGuard interface $INTERFACE."
+	else
+		debug "Adding innner tunnel addresses to WireGuard interface $INTERFACE."
+	fi
+
+	add_undo del_addr
+	for addr in $Address; do
+		set -- ifconfig -n -- "$INTERFACE"
+		case $addr in
+			*:*) set -- "$@" inet6 "$addr" alias no_dad ;;
+			  *) set -- "$@" inet  "$addr" alias ;;
+		esac
+		if "$@"; then
+			info "Added address $addr to WireGuard interface $INTERFACE."
+		else
+			err $? "Failed to add address $addr to WireGuard interface $INTERFACE."
+		fi
+	done
+	flush_cache
+}
+
+# Replace all occurances of %i with $INTERFACE
+replace_interface() {
+	local left='' right="$*"
+	while true; do
+		case "$right" in
+			*%i*) left="${left}${right%%%i*}${INTERFACE}"; right="${right#*%i}" ;;
+			   *) break ;;
+		esac
+	done
+	printf '%s%s' "$left" "$right"
+}
+
+# Invalidate the inverse state, execute the state transition hook undoing setup operations on failure.
+pre_up()    { leave PostDown && add_undo post_down && hook PreUp    "$PreUp"   ; }
+post_up()   { leave PreDown  && add_undo pre_down  && hook PostUp   "$PostUp"  ; }
+pre_down()  { leave PostUp   &&                       hook PreDown  "$PreDown" ; }
+post_down() { leave PreUp    &&                       hook PostDown "$PostDown"; }
+
+# Make sure a per interface run directory exists to hold the state files and lock file.
+run_dir() {
+	if [ -d "${wireguard_run_dir:-}/$INTERFACE" ]; then
+		debug "The run directory for the $INTERFACE WireGuard interface already exists."
+	else
+		if install -d -m 755 -o root -g wheel -- "$wireguard_run_dir" "$wireguard_run_dir/$INTERFACE"; then
+			info "Created run directory for $INTERFACE interface."
+		else
+			err $? "Failed to create run directory for $INTERFACE interface."
+		fi
+	fi
+}
+
+# Attempt to have lockf(1) acquire the lock for an interface and execute the arguments with the lock held.
+with_lock() {
+	run_dir
+	wireguard_lock="$INTERFACE" lockf -wt "${wireguard_timeout:-}" -- "$wireguard_run_dir/$INTERFACE/lock" "$@"
+}
+
+# Test if the interface is recorded to be in state $1.
+in_state() {
+	[ -e "/var/run/wireguard/$INTERFACE/$1" ]
+}
+
+# Mark the interface as in states $*.
+enter() {
+	while [ $# -gt 0 ]; do
+		if [ -e "/var/run/wireguard/$INTERFACE/$1" ]; then
+			debug "WireGuard interface $INTERFACE is already in $1 state."
+		else
+			if : >>"/var/run/wireguard/$INTERFACE/$1"; then
+				debug "WireGuard interface $INTERFACE entered $1 state."
+			else
+				err $? "WireGuard interface $INTERFACE failed to enter $1 state."
+			fi
+		fi
+		shift
+	done
+}
+
+# Remove the marker for states $* from the interface.
+leave() {
+	while [ $# -gt 0 ]; do
+		if [ -e "/var/run/wireguard/$INTERFACE/$1" ]; then
+			if rm -f -- "/var/run/wireguard/$INTERFACE/$1"; then
+				debug "WireGuard interface $INTERFACE left $1 state."
+			else
+				err $? "WireGuard interface $INTERFACE failed to leave $1 state."
+			fi
+		else
+			debug "WireGuard interface $INTERFACE wasn't in $1 state."
+		fi
+		shift
+	done
+}
+
+# Attempt to execute a run transition hook at least once.
+hook() {
+	if in_state "$1"; then
+		debug "Skipped $1 hook on WireGuard interface $INTERFACE."
+	else
+		if [ -n "$2" ]; then
+			if Address="$Address" DNS="$DNS" MTU="$MTU" Table="$Table" SaveConfig="$SaveConfig" Sticky="$Sticky" \
+				sh -s -- "$INTERFACE" "$1" <<- EOF
+					$(replace_interface "$2")
+				EOF
+			then
+				info "The $INTERFACE interface $1 hook succeeded."
+			else
+				warn "The $INTERFACE interface $1 hook failed."
+				return 1
+			fi
+		else
+			debug "There is no $INTERFACE interface $1 hook to execute."
+		fi
+	fi
+	enter "$1"
+}
+
+# Attempt to bring up a WireGuard interface.
+link_up() {
+	add_undo link_down
+	if ! exists; then
+		err 1 "Missing WireGuard interface $INTERFACE to bring up."
+	elif ! in_wg; then
+		err 64 "Refusing to bring up non-WireGuard interface $INTERFACE."
+	else
+		if is_up; then
+			debug "WireGuard interface $INTERFACE is already up."
+		else
+			if ifconfig -n -- "$INTERFACE" up; then
+				info "WireGuard interface $INTERFACE is up."
+				flush_cache
+			else
+				flush_cache
+				err 1 "Failed to bring WireGuard interface $INTERFACE up."
+			fi
+		fi
+	fi
+}
+
+# Bring down a WireGuard interface.
+link_down() {
+	if ! exists; then
+		warn "Missing WireGuard interface $INTERFACE to bring down."
+	elif ! in_wg; then
+		warn "Refusing to bring down non-WireGuard interface $INTERFACE."
+	elif ! is_up; then
+		debug "WireGuard interface $INTERFACE is already down."
+	else
+		if ifconfig -n -- "$INTERFACE" down; then
+			info "WireGuard interface $INTERFACE is down."
+		else
+			flush_cache
+			if ! exists; then
+				warn "Missing WireGuard interface $INTERFACE to bring down."
+			elif ! in_wg; then
+				warn "Refusing to bring down non-WireGuard interface $INTERFACE."
+			else
+				err 1 "Failed to bring WireGuard interface $INTERFACE down."
+			fi
+
+		fi
+	fi
+}
+
+# Remove the resolv.conf $INTERFACE.wg.
+clear_dns() {
+	case " $(resolvconf -i)" in
+		*" $INTERFACE.wg "*)
+			if resolvconf -d "$INTERFACE.wg"; then
+				info "Removed DNS configuration for WireGuard interface $INTERFACE."
+			else
+				case " $(resolvconf -i)" in
+					*" $INTERFACE.wg "*) err 1 "Failed to remove DNS configuration for interface $INTERFACE." ;;
+									  *) info "Removed DNS configuration interface $INTERFACE." ;;
+				esac
+			fi ;;
+
+		*) debug "No DNS configuration for WireGuard interface $INTERFACE to remove." ;;
+	esac
+}
+
+# Remove the resolv.conf and DNS marker.
+del_dns() {
+	clear_dns
+	leave DNS
+}
+
+# Add the WireGuard DNS configuration using resolvconf.
+add_dns() {
+	local IFS=$'\n'
+	add_undo del_dns
+	if resolvconf -a "$INTERFACE.wg" -m 0 -x <<- EOF
+		$*
+	EOF
+	then
+		info "Added DNS configuration for WireGuard interface $INTERFACE."
+	else
+		err $? "Failed to add DNS configuration for WireGuard interface $INTERFACE."
+	fi
+}
+
+# Apply the WireGuard DNS configuration (adding or clearing $INTERFACE.wg).
+set_dns() {
+	local value IFS=$', \t\n' -
+	if [ -n "$DNS" ]; then
+		set -f --; for value in $DNS; do
+			case "$value" in
+				*:*		 ) set -- "$@" "nameserver $value" ;;
+				*[!0-9.]*) set -- "$@" "search	   $value" ;;
+				*		 ) set -- "$@" "nameserver $value" ;;
+			esac
+		done; set +f
+		add_dns "$@"
+	else
+		clear_dns "$@"
+	fi
+	enter DNS
+}
+
+# Call out to netif script to play nice with non-WireGuard specific FreeBSD rc.d features e.g. static routes.
+netif_start() {
+	/etc/rc.d/netif start "$INTERFACE"
+}
+netif_stop() {
+	/etc/rc.d/netif stop "$INTERFACE"
+}
+
+
+
+################################################################################
+# Define rc.d commands in terms of the above operations
+################################################################################
+
+wg_create()   { create;                                             }
+wg_preup()    { set_mtu && set_conf && add_addr && pre_up;          }
+wg_postup()   { link_up && set_dns && post_up;                      }
+
+wg_predown()  { pre_down; del_dns;                                  }
+wg_postdown() { link_down; post_down; del_addr;                     }
+wg_destroy()  { del_conf; destroy;                                  }
+
+wg_start()    { wg_create && wg_preup && wg_postup && netif_start;  }
+wg_stop()     { wg_predown ; wg_postdown ; netif_stop ; wg_destroy; }
+wg_restart()  { wg_stop ; wg_start;                                 }
+
+
+
+################################################################################
+# Parse the WireGuard configuration as far as necessary
+################################################################################
+
+# Good enough "trim" using variable splitting with path expansion disabled
+trim() {
+	set -f -- $*; set +f
+	printf '%s\n' "$*"
+}
+
+# Extract the relevant variables from the WireGuard configuration.
+parse() {
+	local line key value 
+	
+	# Clear the variables
+	Address='' DNS='' MTU='' Table='' SaveConfig='' PreUp='' PostUp='' PreDown='' PostDown='' Sticky=''
+
+	# The filtered configuation can be piped into `wg setkey /dev/stdin`
+	Original='' Filtered=''
+
+	while read -r line; do
+		Original="${Original}${line}"$'\n'
+		line="${line%%#*}" # remove comments
+		case $line in
+			*=*)
+				key="$(trim "${line%%=*}")"
+				value="${line#*=}"
+				case $key in
+					Address   ) Address="${Address}${value},"		;;
+					DNS		  ) DNS="${DNS}${value},"				;;
+					MTU		  ) MTU="$(trim "$value")"				;;
+					Table	  ) Table="$(trim "$value")"			;;
+					SaveConfig) SaveConfig="$(trim "$value")"		;;
+					Sticky	  ) Sticky="$(trim "$value")"			;;
+					PreUp	  ) PreUp="${PreUp}${value}"$'\n'		;;
+					PostUp	  ) PostUp="${PostUp}${value}"$'\n'		;;
+					PreDown   ) PreDown="${PreDown}${value}"$'\n'	;;
+					PostDown  ) PostDown="${PostDown}${value}"$'\n' ;;
+					*         ) Filtered="${Filtered}${line}"$'\n'  ;;
+				esac
+				;;
+			*)
+				Filtered="${Filtered}${line}"$'\n'
+		esac
+	done < "/etc/wireguard/$INTERFACE.conf"
+
+	# The FreeBSD specific $Sticky flag preserves the WireGuard interface.
+	if [ -z "$Sticky" ]; then
+		if [ -k "/etc/wireguard/$INTERFACE.conf" ]; then
+			Sticky='YES'
+		else
+			Sticky='NO'
+		fi
+	fi
+}
+
+# Execute the arguments after parsing the interface configuration
+with_conf() {
+	parse && "$@"
+}
+
+# Apply the command given as first argument to the list of interfaces in the remaining arguments.
+#   * acquire the interface's lock 
+#   * parse the interface configuration
+#   * attempt to undo failed (setup) operations
+run() {
+	local cmd="$1"; shift
+	validate_names "$@" &&
+	while [ $# -gt 0 ]; do
+		INTERFACE="$1"
+		if [ "$wireguard_lock" = "$1" ]; then
+			with_conf "wg_$cmd" && flush_undo
+		else
+			with_lock sh /etc/rc.d/$name "${_rc_prefix:-}${cmd}" "$1"
+		fi
+		shift
+	done
+}
+
+run_rc_command "$@"

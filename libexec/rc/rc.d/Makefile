@@ -108,7 +108,8 @@ CONFS=	DAEMON \
 	${_utx} \
 	var \
 	var_run \
-	watchdogd
+	watchdogd \
+	wireguard
 
 CONFGROUPS+=		DEVD
 DEVD=			devd
