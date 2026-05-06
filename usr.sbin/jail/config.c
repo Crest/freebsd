@@ -329,7 +329,7 @@ parse_config(const char *cfname, int is_stdin)
 		cflex.cfname = "STDIN";
 		yyset_in(stdin, scanner);
 	} else {
-		yfp = fopen(cfname, "r");
+		yfp = fopen(cfname, "re");
 		if (!yfp)
 			err(1, "%s", cfname);
 		yyset_in(yfp, scanner);
