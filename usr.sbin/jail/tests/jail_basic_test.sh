@@ -307,6 +307,19 @@ param_consistency_cleanup()
 	fi
 }
 
+atf_test_case "config_file_leak"
+config_file_leak_head()
+{
+	atf_set descr 'Do not leak included jail.conf file descriptors'
+}
+
+config_file_leak_body()
+{
+	atf_check -s exit:0 -o empty -e empty \
+		sh -c "ulimit -n 20 && jail -f \"\${1:?}\" -e \$'\\n'" \
+			sh "$(atf_get_srcdir)/leaky.jail.conf"
+}
+
 atf_test_case "setaudit"
 setaudit_head()
 {
@@ -334,5 +347,6 @@ atf_init_test_cases()
 	atf_add_test_case "commands"
 	atf_add_test_case "jid_name_set"
 	atf_add_test_case "param_consistency"
+	atf_add_test_case "config_file_leak"
 	atf_add_test_case "setaudit"
 }
