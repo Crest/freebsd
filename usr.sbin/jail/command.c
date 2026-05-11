@@ -53,6 +53,7 @@
 
 #define DEFAULT_STOP_TIMEOUT	10
 #define PHASH_SIZE		256
+#define _PATH_JEXEC		"/usr/sbin/jexec"
 
 LIST_HEAD(phhead, phash);
 
@@ -289,14 +290,17 @@ run_command(struct cfjail *j)
 	const struct passwd *pwd;
 	const struct cfstring *comstring, *s;
 	login_cap_t *lcap;
-	const char **argv;
+	const char **argv, **jexec_argv;
 	char *acs, *cs, *comcs, *devpath;
-	const char *jidstr, *conslog, *fmt, *path, *ruleset, *term, *username;
+	char jailid[16];
+	const char *jailname, *jidstr, *conslog, *fmt, *path, *ruleset, *term;
+	const char *username;
 	enum intparam comparam;
 	size_t comlen, ret;
 	pid_t pid;
 	cpusetid_t setid;
-	int argc, bg, clean, consfd, down, fib, i, injail, sjuser, timeout;
+	int argc, bg, clean, consfd, down, fib, i, injail, jargc, sjuser;
+	int timeout;
 #if defined(INET) || defined(INET6)
 	char *addr, *extrap, *p, *val;
 #endif
@@ -740,19 +744,7 @@ run_command(struct cfjail *j)
 	if (bg)
 		setsid();
 
-	/* Set up the environment and run the command */
-	pwd = NULL;
-	lcap = NULL;
-	if ((clean || username) && injail && sjuser &&
-	    get_user_info(j, username, &pwd, &lcap) < 0)
-		exit(1);
 	if (injail) {
-		/* jail_attach won't chdir along with its chroot. */
-		path = string_param(j->intparams[KP_PATH]);
-		if (path && chdir(path) < 0) {
-			jail_warnx(j, "chdir %s: %s", path, strerror(errno));
-			exit(1);
-		}
 		if (int_param(j->intparams[IP_EXEC_FIB], &fib) &&
 		    setfib(fib) < 0) {
 			jail_warnx(j, "setfib: %s", strerror(errno));
@@ -761,24 +753,63 @@ run_command(struct cfjail *j)
 
 		/*
 		 * We wouldn't have specialized our affinity, so just setid to
-		 * root.  We do this prior to attaching to avoid the kernel
-		 * having to create a transient cpuset that we'll promptly
-		 * free up with a reset to the jail's cpuset.
+		 * root.  jexec will attach this process to the jail, prompting
+		 * the kernel to reset its cpuset to the jail's cpuset.
 		 *
-		 * This is just a best-effort to use as wide of mask as
-		 * possible.
+		 * This is just a best-effort to use as wide of mask as possible.
 		 */
 		if (setid != CPUSET_INVALID)
 			(void)cpuset_setid(CPU_WHICH_PID, -1, setid);
 
-		if (jail_attach(j->jid) < 0) {
-			jail_warnx(j, "jail_attach: %s", strerror(errno));
+		if (consfd != 0 &&
+		    (dup2(consfd, 1) < 0 || dup2(consfd, 2) < 0)) {
+			jail_warnx(j, "exec.consolelog: %s", strerror(errno));
 			exit(1);
 		}
+
+		jailname = string_param(j->intparams[KP_NAME]);
+		if (jailname == NULL)
+			jailname = string_param(j->intparams[KP_JID]);
+		if (jailname == NULL) {
+			(void)snprintf(jailid, sizeof(jailid), "%d", j->jid);
+			jailname = jailid;
+		}
+
+		jargc = 1;
+		if (clean)
+			jargc++;
+		if (username != NULL)
+			jargc += 2;
+		jargc += 2;
+		for (i = 0; argv[i] != NULL; i++)
+			jargc++;
+
+		jexec_argv = alloca((jargc + 1) * sizeof(char *));
+		jargc = 0;
+		jexec_argv[jargc++] = _PATH_JEXEC;
+		if (clean)
+			jexec_argv[jargc++] = "-l";
+		if (username != NULL) {
+			jexec_argv[jargc++] = sjuser ? "-u" : "-U";
+			jexec_argv[jargc++] = username;
+		}
+		jexec_argv[jargc++] = "--";
+		jexec_argv[jargc++] = jailname;
+		for (i = 0; argv[i] != NULL; i++)
+			jexec_argv[jargc++] = argv[i];
+		jexec_argv[jargc] = NULL;
+
+		closefrom(3);
+		execv(_PATH_JEXEC, __DECONST(char *const *, jexec_argv));
+		jail_warnx(j, "exec %s: %s", _PATH_JEXEC, strerror(errno));
+		exit(1);
 	}
+
+	/* Set up the environment and run the command */
+	pwd = NULL;
+	lcap = NULL;
 	if (clean || username) {
-		if (!(injail && sjuser) &&
-		    get_user_info(j, username, &pwd, &lcap) < 0)
+		if (get_user_info(j, username, &pwd, &lcap) < 0)
 			exit(1);
 		if (clean) {
 			term = getenv("TERM");
